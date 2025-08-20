@@ -1,10 +1,12 @@
 from datetime import datetime,timedelta,timezone
 from jose import jwt,JWTError
 from passlib.context import CryptContext
+import os
 
-SECRET_KEY = "mysecretkey"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = os.getenv("ALGORITHM")
+
 
 def create_access_token(data:dict,expires_delta:timedelta | None=None):
     to_encode = data.copy()
