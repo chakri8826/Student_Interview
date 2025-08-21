@@ -1,1 +1,292 @@
 .env
+# Updated user_routes.py with LinkedIn OAuth
+
+from fastapi import FastAPI, Depends, HTTPException, APIRouter, Request
+from typing import Annotated
+from sqlmodel import select
+from fastapi.security import OAuth2PasswordRequestForm
+from app.models.user_model import User
+from app.auth import create_access_token, hash_password, verify_password, ACCESS_TOKEN_EXPIRE_MINUTES
+from app.schemas.user_schemas import CreateUser, Token
+from app.dependencies import SessionDep, get_curr_user
+from datetime import timedelta
+import os
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+from authlib.integrations.starlette_client import OAuth
+from starlette.responses import RedirectResponse
+import httpx
+import secrets
+import string
+
+router = APIRouter()
+
+# Environment Variables
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+
+# LinkedIn OAuth Settings
+LINKEDIN_CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
+LINKEDIN_CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
+LINKEDIN_REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI")
+
+# Setup OAuth
+oauth = OAuth()
+
+# Google OAuth Configuration
+oauth.register(
+    name='google',
+    client_id=GOOGLE_CLIENT_ID,
+    client_secret=GOOGLE_CLIENT_SECRET,
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'}
+)
+
+# LinkedIn OAuth Configuration
+oauth.register(
+    name='linkedin',
+    client_id=LINKEDIN_CLIENT_ID,
+    client_secret=LINKEDIN_CLIENT_SECRET,
+    authorize_url='https://www.linkedin.com/oauth/v2/authorization',
+    token_url='https://www.linkedin.com/oauth/v2/accessToken',
+    client_kwargs={'scope': 'openid profile email'}
+)
+
+
+# ================================
+# GOOGLE OAUTH ENDPOINTS
+# ================================
+
+@router.get("/google")
+async def login_google(request: Request):
+    return await oauth.google.authorize_redirect(request, redirect_uri=GOOGLE_REDIRECT_URI)
+
+
+@router.get("/google-login")  
+async def google_login(request: Request, session: SessionDep):
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    
+    if not code:
+        raise HTTPException(status_code=400, detail="Authorization code not found")
+    
+    try:
+        # Exchange code for tokens
+        token_url = "https://oauth2.googleapis.com/token"
+        
+        token_data = {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": GOOGLE_REDIRECT_URI
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(token_url, data=token_data)
+            tokens = response.json()
+        
+        if "access_token" not in tokens:
+            raise HTTPException(status_code=400, detail=f"Failed to get access token: {tokens}")
+        
+        # Get user info from Google
+        user_info_url = "https://www.googleapis.com/oauth2/v2/userinfo"
+        headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+        
+        async with httpx.AsyncClient() as client:
+            user_response = await client.get(user_info_url, headers=headers)
+            user_data = user_response.json()
+        
+        # Process user data (existing or new)
+        return await process_oauth_user(session, user_data, "google")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Google login failed: {str(e)}")
+
+
+# ================================
+# LINKEDIN OAUTH ENDPOINTS
+# ================================
+
+@router.get("/linkedin")
+async def login_linkedin(request: Request):
+    return await oauth.linkedin.authorize_redirect(request, redirect_uri=LINKEDIN_REDIRECT_URI)
+
+
+@router.get("/linkedin-login")  
+async def linkedin_login(request: Request, session: SessionDep):
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    
+    if not code:
+        raise HTTPException(status_code=400, detail="Authorization code not found")
+    
+    try:
+        # Exchange code for tokens
+        token_url = "https://www.linkedin.com/oauth/v2/accessToken"
+        
+        token_data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": LINKEDIN_CLIENT_ID,
+            "client_secret": LINKEDIN_CLIENT_SECRET,
+            "redirect_uri": LINKEDIN_REDIRECT_URI
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                token_url, 
+                data=token_data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            tokens = response.json()
+        
+        if "access_token" not in tokens:
+            raise HTTPException(status_code=400, detail=f"Failed to get access token: {tokens}")
+        
+        # Get user info from LinkedIn
+        user_info_url = "https://api.linkedin.com/v2/userinfo"
+        headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+        
+        async with httpx.AsyncClient() as client:
+            user_response = await client.get(user_info_url, headers=headers)
+            user_data = user_response.json()
+        
+        # LinkedIn returns different format, normalize it
+        normalized_user_data = {
+            "email": user_data.get("email"),
+            "name": user_data.get("name") or f"{user_data.get('given_name', '')} {user_data.get('family_name', '')}".strip(),
+            "given_name": user_data.get("given_name"),
+            "family_name": user_data.get("family_name"),
+            "picture": user_data.get("picture")
+        }
+        
+        # Process user data (existing or new)
+        return await process_oauth_user(session, normalized_user_data, "linkedin")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"LinkedIn login failed: {str(e)}")
+
+
+# ================================
+# SHARED OAUTH USER PROCESSING
+# ================================
+
+async def process_oauth_user(session: SessionDep, user_data: dict, provider: str):
+    """
+    Process OAuth user data for both Google and LinkedIn
+    """
+    email = user_data.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail=f"{provider.title()} did not provide email address")
+    
+    # Check if user already exists
+    existing_user = session.exec(
+        select(User).where(User.email == email)
+    ).first()
+    
+    if existing_user:
+        # User exists, create access token and return
+        expire = timedelta(minutes=int(ACCESS_TOKEN_EXPIRE_MINUTES))
+        access_token = create_access_token(
+            data={"sub": existing_user.email}, 
+            expires_delta=expire
+        )
+        
+        return {
+            "message": "Login successful",
+            "provider": provider,
+            "user": {
+                "id": existing_user.id,
+                "name": existing_user.name,
+                "email": existing_user.email,
+                "city": existing_user.city
+            },
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+    
+    else:
+        # New user, create account
+        random_password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+        hashed_password = hash_password(random_password)
+        
+        # Ensure name is at least 3 characters (User model requirement)
+        name = user_data.get("name", f"{provider.title()} User")[:50]
+        if len(name.strip()) < 3:
+            name = f"{provider.title()} User"
+        
+        new_user = User(
+            name=name,
+            email=email,
+            password=hashed_password,
+            city=None  # Neither Google nor LinkedIn provides city by default
+        )
+        
+        session.add(new_user)
+        session.commit()
+        session.refresh(new_user)
+        
+        # Create access token for new user
+        expire = timedelta(minutes=int(ACCESS_TOKEN_EXPIRE_MINUTES))
+        access_token = create_access_token(
+            data={"sub": new_user.email}, 
+            expires_delta=expire
+        )
+        
+        return {
+            "message": "Registration and login successful",
+            "provider": provider,
+            "user": {
+                "id": new_user.id,
+                "name": new_user.name,
+                "email": new_user.email,
+                "city": new_user.city
+            },
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+
+
+# ================================
+# EXISTING ENDPOINTS
+# ================================
+
+@router.post("/register")
+def register(session: SessionDep, user_data: CreateUser):
+    if session.exec(select(User).where(User.email == user_data.email)).first():
+        raise HTTPException(status_code=400, detail="Email is already registered")
+    hash_pwd = hash_password(user_data.password)
+
+    user = User(name=user_data.name, email=user_data.email, password=hash_pwd, city=user_data.city)
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+
+@router.post("/login", response_model=Token)
+def login(session: SessionDep, form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    user = session.exec(select(User).where(User.email == form_data.username)).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="Invalid Credentials")
+
+    pwd = verify_password(form_data.password, user.password)
+
+    if not pwd:
+        raise HTTPException(status_code=404, detail="Invalid Credentials")
+
+    expire = timedelta(minutes=int(ACCESS_TOKEN_EXPIRE_MINUTES))
+    token = create_access_token(data={"sub": user.email}, expires_delta=expire)
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@router.get("/profile")
+def profile(current_user: Annotated[User, Depends(get_curr_user)]):
+    return {"name": current_user.name, "email": current_user.email}
